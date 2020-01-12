@@ -4,6 +4,7 @@ import io
 import codecs
 import spacy
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from torchtext import data, datasets
 from configuration import src_lan, tgt_lan, cfg, device
 
@@ -139,7 +140,7 @@ class MyIterator(data.Iterator):
 
 print("Loading the data ...")
 SRC = data.Field(tokenize=src_tokenizer, lower=bool(cfg.lowercase_data), pad_token=cfg.pad_token,
-                 unk_token=cfg.unk_token, include_lengths=True)
+                 unk_token=cfg.unk_token, init_token=cfg.bos_token, eos_token=cfg.eos_token, include_lengths=True)
 TGT = data.Field(tokenize=tgt_tokenizer, lower=bool(cfg.lowercase_data), pad_token=cfg.pad_token,
                  unk_token=cfg.unk_token, init_token=cfg.bos_token, eos_token=cfg.eos_token, include_lengths=True)
 if cfg.dataset_name == "multi30k16":
@@ -175,11 +176,27 @@ print("Number of training examples: {}".format(len(train.examples)))
 print("Number of validation examples: {}".format(len(val.examples)))
 print("Number of testing examples: {}".format(len(test.examples)))
 
-SRC.build_vocab(train, max_size=int(cfg.max_vocab_src), min_freq=int(cfg.min_freq_src))
-TGT.build_vocab(train, max_size=int(cfg.max_vocab_tgt), min_freq=int(cfg.min_freq_tgt))
+commons_path = Path("../resources/{}_{}_{}.common.vocab".format(cfg.dataset_name, src_lan, tgt_lan))
+commons_path = commons_path if commons_path.exists() else \
+    Path("../resources/{}_{}_{}.common.vocab".format(cfg.dataset_name, tgt_lan, src_lan))
+specials = []
+common_vocab_size = 4
+if commons_path.exists():
+    specials = list(commons_path.open("r").read().split("\n"))
+    specials.remove(cfg.bos_token)
+    specials.remove(cfg.eos_token)
+    specials.remove(cfg.unk_token)
+    specials.remove(cfg.pad_token)
+    common_vocab_size += len(specials)
+SRC.build_vocab(train, max_size=int(cfg.max_vocab_src), min_freq=int(cfg.min_freq_src), specials=specials)
+TGT.build_vocab(train, max_size=int(cfg.max_vocab_tgt), min_freq=int(cfg.min_freq_tgt), specials=specials)
 
+if len(specials):
+    assert SRC.vocab.itos[common_vocab_size-1] == TGT.vocab.itos[common_vocab_size-1]
+    assert SRC.vocab.itos[common_vocab_size] != TGT.vocab.itos[common_vocab_size]
 print("Unique tokens in source ({}) vocabulary: {}".format(src_lan, len(SRC.vocab)))
 print("Unique tokens in target ({}) vocabulary: {}".format(tgt_lan, len(TGT.vocab)))
+print("Size of source/target common vocabulary: {}".format(common_vocab_size))
 
 # Replaced the Bucket Iterator with the suggested iterator in here:
 # http://nlp.seas.harvard.edu/2018/04/03/attention.html
