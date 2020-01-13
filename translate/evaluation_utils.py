@@ -19,21 +19,47 @@ def convert_target_batch_back(btch, TGT):
     """
     non_desired__ids = [TGT.vocab.stoi[cfg.pad_token], TGT.vocab.stoi[cfg.bos_token]]
     eos = TGT.vocab.stoi[cfg.eos_token]
+    tgt_vocab_size = len(TGT.vocab.itos)
     s_len, batch_size = btch.size()
     result = []
     for b in range(batch_size):
         tmp_res = []
         for w in range(s_len):
             itm = btch[w, b]
+            # p_gen = p_gens[w, b].item() if p_gens is not None else 1.0
             if itm == eos:
                 break
             if itm not in non_desired__ids:
-                cvrted = TGT.vocab.itos[int(itm)]
+                int_itm = int(itm)
+                if int_itm < tgt_vocab_size:
+                    cvrted = TGT.vocab.itos[int_itm]
+                    # assert p_gen > 0.5, "P_gen is {:.3f}".format(p_gen)  # To make sure there is no bug in training
+                else:
+                    # assert int_itm != tgt_vocab_size
+                    ptr_id = int_itm - tgt_vocab_size - 1
+                    cvrted = "<src>_{}".format(ptr_id)
                 tmp_res.append(cvrted)
+                """
+                if p_gen > 0.5:
+                    cvrted = TGT.vocab.itos[int(itm)]
+                else:
+                    cvrted = cfg.unk_token
+                """
         result.append(" ".join(tmp_res))
     return result
     # return [" ".join([TGT.vocab.itos[int(btch[w, b])]
     #                  for w in range(s_len) if btch[w, b] not in non_desired__ids]) for b in range(batch_size)]
+
+
+def recover_copy_tokens(decoded: str, source: str):
+    source_tokens = source.split()
+    decoded_tokens = decoded.split()
+    # TODO try lexical translation first
+    try:
+        result = [token if "<src>" not in token else source_tokens[int(token.split("_")[-1])] for token in decoded_tokens]
+        return " ".join(result)
+    except IndexError:
+        return decoded
 
 
 def postprocess_decoded(decoded_sentence, input_sentence, attention_scores):
@@ -79,6 +105,10 @@ def evaluate(data_iter: data.BucketIterator, TGT: data.field, model: nn.Module,
                 if bool(cfg.lowercase_data):
                     source_sentence = source_sentence.lower()
                     reference_sentence = reference_sentence.lower()
+                if "<src>" in model_expected:
+                    raise ValueError("Copy mechanism is not possible to have kicked in the reference.")
+                if "<src>" in decoded:
+                    decoded = recover_copy_tokens(decoded, source_sentence)
                 decoded = postprocess_decoded(decoded, source_sentence, max_attention_idcs.select(1, d_id))
                 if bool(cfg.dataset_is_in_bpe):
                     decoded = decoded.replace("@@ ", "")
@@ -87,8 +117,8 @@ def evaluate(data_iter: data.BucketIterator, TGT: data.field, model: nn.Module,
                 sent_count += 1.0
                 if not random_sample_created and random.random() < 0.01:
                     random_sample_created = True
-                    print("Sample Pred : {}\nModel Expc'd: {}\nSample Act'l: {}".format(
-                        decoded, model_expected, reference_sentence))
+                    print("Source Sent': {}\nSample Pred : {}\nModel Expc'd: {}\nSample Act'l: {}".format(
+                        source_sentence, decoded, model_expected, reference_sentence))
         # valid_instance = next(iter(val_iter))
         # pred, _, _, _ = model(valid_instance.src, valid_instance.trg)
         # cpreds = convert_target_batch_back(pred)

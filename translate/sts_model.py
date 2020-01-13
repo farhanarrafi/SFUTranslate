@@ -4,6 +4,7 @@ from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torchtext import data
 from configuration import cfg, device
+import numpy as np
 
 
 class DecodingSearchNode:
@@ -36,14 +37,16 @@ class DecodingSearchNode:
 
 
 class STS(nn.Module):
-    def __init__(self, SRC: data.Field, TGT: data.Field):
+    def __init__(self, SRC: data.Field, TGT: data.Field, common_vocab_size: int):
         """
         :param SRC: the trained torchtext.data.Field object containing the source side vocabulary
         :param TGT: the trained torchtext.data.Field object containing the target side vocabulary
+        :param common_vocab_size: the size of the common vocabulary read and put in the beginning of the vocab objects
         """
         super(STS, self).__init__()
         self.SRC = SRC
         self.TGT = TGT
+        self.common_vocab_size = common_vocab_size
         self.criterion = nn.CrossEntropyLoss(ignore_index=TGT.vocab.stoi[cfg.pad_token], reduction='sum')
         self.bahdanau_attention = bool(cfg.bahdanau_attention)
         print("Creating the Seq2Seq Model with {} attention".format("Bahdanau" if self.bahdanau_attention else "Loung"))
@@ -106,6 +109,11 @@ class STS(nn.Module):
         self.beam_size = int(cfg.beam_size)
         self.beam_search_length_norm_factor = float(cfg.beam_search_length_norm_factor)
         self.beam_search_coverage_penalty_factor = float(cfg.beam_search_coverage_penalty_factor)
+        # copy mechanism
+        # + self.decoder_hidden + self.decoder_input_size
+        self.switching_layer = nn.Linear(self.encoder_hidden * (2 if self.encoder_bidirectional else 1), 1)
+        # init last layer biases to -1
+        # self.mse_loss = nn.MSELoss(reduction='none')
 
     def forward(self, input_tensor_with_lengths, output_tensor_with_length=None, test_mode=False):
         """
@@ -161,7 +169,8 @@ class STS(nn.Module):
         :param test_mode: a flag indicating whether the model is allowed to use the target tensor for input feeding
         """
         # #################################INITIALIZATION OF ENCODING PARAMETERS#######################################
-        input_sequence_length, batch_size = input_tensor_with_lengths[0].size()
+        input_tensor = input_tensor_with_lengths[0]
+        input_sequence_length, batch_size = input_tensor.size()
         if output_tensor_with_length is not None:
             output_tensor, outputs_lengths = output_tensor_with_length
             tokens_count = float(outputs_lengths.sum().item())
@@ -185,26 +194,34 @@ class STS(nn.Module):
         eos_predicted = decoding_initializer.eos_predicted
         cumulative_loss = decoding_initializer.cumulative_loss
         loss_size = decoding_initializer.loss_size
+        # p_gens = torch.zeros(target_length, batch_size, device=device)
 
         # #################################ITERATIVE GENERATION OF THE OUTPUT##########################################
         for t in range(target_length):
-            p_gen, query, decoder_context = self.next_target_distribution(next_token, decoder_context, c_t, batch_size)
+            p_vcb, query, decoder_context = self.next_target_distribution(next_token, decoder_context, c_t, batch_size)
             alphas = self.compute_attention_scores(query, encoder_memory,
                                                    attention_mask, input_sequence_length, coverage_vector)
             max_attention_indices[t, :] = alphas.max(dim=-1)[1].view(-1).detach()  # batch_size
             c_t = (alphas @ encoder_output.transpose(0, 1)).squeeze(1)
-            greedy_prediction = torch.argmax(p_gen, dim=1).detach()
-            next_token = greedy_prediction  # greedy approach
-            eos_predicted = torch.max(eos_predicted, (greedy_prediction == self.TGT.vocab.stoi[cfg.eos_token]))
+            final_o, gen_o, p_generate = self.extract_final_output(input_tensor, c_t, p_vcb, alphas)
+            # p_gens[t, :] = p_generate.view(-1).detach()
+            # greedy_predi5ction = torch.argmax(gen_o, dim=1).detach()
+            # greedy_predi5ction = torch.argmax(p_vcb, dim=1).detach()
+            target_vocab_prediction = torch.argmax(gen_o, dim=1).detach()  # greedy approach
+            p_w_prediction = torch.argmax(final_o, dim=1).detach()  # greedy approach
+            next_token = target_vocab_prediction
+            eos_predicted = torch.max(eos_predicted, (p_w_prediction == self.TGT.vocab.stoi[cfg.eos_token]))
             if output_tensor is not None:
                 if not test_mode:  # Input Feeding
                     next_token = output_tensor.select(0, t + 1) if t < output_tensor.size(0) - 1 else pad_token
-                cumulative_loss += self.criterion(p_gen, next_token)
+                # cumulative_loss += self.criterion(p_gen, next_token)
+                cumulative_loss += (self.criterion(p_vcb, next_token) + self.criterion(final_o, next_token)) / 2 + \
+                                   ((next_token == self.TGT.vocab.stoi[cfg.unk_token]).float() * p_generate.view(-1)).sum()
                 loss_size += 1.0
             predicted_tokens_count += batch_size - eos_predicted.sum().item()
             if sum(eos_predicted.int()) == batch_size:
                 break
-            result[t, :] = greedy_prediction
+            result[t, :] = p_w_prediction
             if self.coverage:
                 # coverage_vector = coverage_vector + ((1.0 / (phi_j + 1e-32)) * alphas).squeeze(1).unsqueeze(-1)
                 cvg_formatted_alphas = alphas.squeeze(1)
@@ -214,6 +231,35 @@ class STS(nn.Module):
                     min_coverage_and_attn = torch.min(masked_coverage, cvg_formatted_alphas)
                     cumulative_loss = cumulative_loss + self.coverage_lambda * min_coverage_and_attn.sum()
         return result, max_attention_indices, cumulative_loss,  loss_size, tokens_count
+
+    def extract_final_output(self, input_tensor, c_t, generated_output, alphas):
+        """
+        :param input_tensor: (max_seq_length, batch_size)
+        :param c_t: (batch_size, self.encoder_hidden * [2 if bidirectional else 1])
+        :param generated_output: (batch_size, target_vocab_size) [NOT A PROBABILITY DISTRIBUTION]
+        :param alphas: (batch_size, 1, max_seq_length)
+        """
+        input_sequence_length, batch_size = input_tensor.size()
+        # switch_input = torch.cat([query, c_t, decoder_input.squeeze(0)], dim=-1)
+        # p_gen = torch.lt(torch.sigmoid(self.switching_layer(switch_input)), 0.5).float()
+        # p_gen: [batch_size x 1]
+        p_gen = torch.lt(torch.sigmoid(self.switching_layer(c_t)), 0.5).float()
+        # p_gen = torch.sigmoid(self.switching_layer(c_t)).float()
+        # p_gen_values[t, :] = p_gen.view(-1)
+        gen_o = p_gen * self.softmax(generated_output)
+        input_common_indices = (input_tensor < self.common_vocab_size).t()  # bsize * source_size
+        copy_o_orig = (1-p_gen) * alphas.squeeze(1)  # torch.zeros_like(alp)  # batch * source_size
+        copy_o_zeros = torch.zeros_like(copy_o_orig)
+        copy_o = torch.where(input_common_indices, copy_o_zeros, copy_o_orig)
+        copy_to_short_list_values = (input_common_indices.float() * copy_o).detach().cpu().numpy()
+        it = input_tensor.cpu().numpy()
+        final_o = torch.cat([gen_o, copy_o], dim=-1)
+        temp_final = np.zeros((final_o.size(0), final_o.size(1)))
+        for b in range(batch_size):
+            for s in range(input_sequence_length):
+                ival = it[s, b]
+                temp_final[b, ival if ival < self.common_vocab_size else 0] = copy_to_short_list_values[b, s]
+        return final_o + torch.from_numpy(temp_final).to(device).float(), gen_o, p_gen
 
     def compute_attention_scores(self, query, memory, attention_mask, input_sequence_length, coverage_vector=None):
         """
@@ -266,6 +312,7 @@ class STS(nn.Module):
         nodes = [decoding_initializer]
         last_created_node_id = decoding_initializer.id
         final_results = []
+        p_gens = torch.zeros(target_length, batch_size, device=device)
 
         # #################################ITERATIVE GENERATION OF THE OUTPUT##########################################
         for step in range(target_length):
@@ -276,9 +323,9 @@ class STS(nn.Module):
             all_lm_scores = torch.zeros(batch_size, len(nodes) * k, device=device).float()
 
             for n_id, node in enumerate(nodes):
-                p_gen, query, decoder_lstm_context = self.next_target_distribution(
+                p_vcb, query, decoder_lstm_context = self.next_target_distribution(
                     node.next_token, node.decoder_lstm_context, node.c_t, batch_size)
-                node.set_result(self.softmax(p_gen), query, decoder_lstm_context)
+                node.set_result(self.softmax(p_vcb), query, decoder_lstm_context)
                 k_values, k_indices = torch.topk(node.result_output, dim=1, k=k)
                 for beam_index in range(k):
                     overall_index = n_id * k + beam_index
@@ -360,7 +407,7 @@ class STS(nn.Module):
                     best_att = node.max_attention_indices[:, b_ind]
             result[:best_tokens[1:].size(0), b_ind] = best_tokens[1:]
             max_attention_indices[:, b_ind] = best_att
-        return result, max_attention_indices, torch.zeros(1, device=device),  1.0, tokens_count
+        return result, max_attention_indices, torch.zeros(1, device=device),  1.0, tokens_count, p_gens
 
     def reformat_encoder_hidden_states(self, encoder_hidden_prams):
         """

@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from tqdm import tqdm
 from configuration import cfg, device
-from reader import train_iter, val_iter, src_val_file_address, tgt_val_file_address
+from reader import train_iter, val_iter, src_val_file_address, tgt_val_file_address, common_vocab_size
 from optimizers import get_a_new_optimizer
 from sts_model import STS
 from init_nn import weight_init
@@ -12,8 +12,9 @@ from evaluation_utils import evaluate
 
 def main_sts():
     from reader import SRC, TGT
-    model = STS(SRC, TGT).to(device)
+    model = STS(SRC, TGT, common_vocab_size).to(device)
     model.apply(weight_init)
+    nn.init.constant_(model.switching_layer.bias, -1)
     torch.save({'model': model, 'field_src': SRC, 'field_tgt': TGT}, cfg.checkpoint_name)
     optimizer, scheduler = get_a_new_optimizer(cfg.init_optim, cfg.init_learning_rate, model.parameters())
     size_train = len([_ for _ in train_iter])
